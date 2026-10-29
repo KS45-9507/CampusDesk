@@ -1,4 +1,21 @@
 document.addEventListener("DOMContentLoaded", () => {
+  const menuButton = document.querySelector(".mobile-menu-toggle");
+  const menuBackdrop = document.querySelector(".nav-backdrop");
+  const closeMobileMenu = () => {
+    document.body.classList.remove("mobile-nav-open");
+    menuButton?.setAttribute("aria-expanded", "false");
+    menuButton?.setAttribute("aria-label", "Open navigation menu");
+  };
+  if (menuButton && menuBackdrop) {
+    menuButton.addEventListener("click", () => {
+      const open = document.body.classList.toggle("mobile-nav-open");
+      menuButton.setAttribute("aria-expanded", open ? "true" : "false");
+      menuButton.setAttribute("aria-label", open ? "Close navigation menu" : "Open navigation menu");
+    });
+    menuBackdrop.addEventListener("click", closeMobileMenu);
+    document.querySelectorAll(".sidebar .nav-link").forEach((link) => link.addEventListener("click", closeMobileMenu));
+    document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeMobileMenu(); });
+  }
   const themeToggle = document.querySelector(".theme-toggle");
   const savedTheme = window.localStorage.getItem("campusdesk-theme");
   if (savedTheme === "dark") document.body.classList.add("dark-mode");
