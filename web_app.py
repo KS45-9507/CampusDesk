@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import csv
+import base64
+import hashlib
+import hmac
 import io
+import json
 import os
 import secrets
 import sqlite3
@@ -30,7 +34,13 @@ DB_PATH = Path(os.environ.get("CAMPUSDESK_DB_PATH", str(ROOT / "student_informat
 if os.environ.get("VERCEL") and "CAMPUSDESK_DB_PATH" not in os.environ:
     DB_PATH = Path(tempfile.gettempdir()) / "campusdesk-demo.db"
 ROLES = {"Administrator", "Faculty", "Student"}
-SESSIONS: dict[str, dict[str, object]] = {}
+SESSION_SECRET = os.environ.get("CAMPUSDESK_SESSION_SECRET", "")
+if os.environ.get("VERCEL") and not SESSION_SECRET:
+    raise RuntimeError("Set CAMPUSDESK_SESSION_SECRET in the Vercel project environment variables.")
+if not SESSION_SECRET:
+    # Local development only. Restarting the local process signs everyone out.
+    SESSION_SECRET = secrets.token_urlsafe(48)
+SESSION_SECRET_BYTES = SESSION_SECRET.encode("utf-8")
 MAX_BODY = 1_500_000
 
 
@@ -45,15 +55,25 @@ def _session(environ):
     except cookies.CookieError:
         pass
     key = jar.get("campusdesk_session")
-    sid = key.value if key else ""
-    existing = SESSIONS.get(sid)
-    if not existing or float(existing.get("expires_at", 0)) < time.time():
-        SESSIONS.pop(sid, None)
-        sid = secrets.token_urlsafe(24)
-        SESSIONS[sid] = {"role": "", "student_id": "", "display_name": "", "authenticated": False,
-                         "csrf": secrets.token_urlsafe(24), "expires_at": time.time() + 28_800}
-        return sid, SESSIONS[sid], True
-    return sid, existing, False
+    if key:
+        try:
+            encoded, supplied_signature = key.value.rsplit(".", 1)
+            expected_signature = hmac.new(SESSION_SECRET_BYTES, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+            if hmac.compare_digest(supplied_signature, expected_signature):
+                padded = encoded + "=" * (-len(encoded) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+                if float(claims.get("expires_at", 0)) >= time.time():
+                    session = {name: claims.get(name, "") for name in
+                               ("role", "student_id", "display_name", "login_name", "authenticated", "csrf", "sid")}
+                    session["expires_at"] = float(claims["expires_at"])
+                    session["_sid"] = session.pop("sid")
+                    return session["_sid"], session, False
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeError):
+            pass
+    sid = secrets.token_urlsafe(24)
+    session = {"role": "", "student_id": "", "display_name": "", "login_name": "", "authenticated": False,
+               "csrf": secrets.token_urlsafe(24), "expires_at": time.time() + 28_800, "_sid": sid}
+    return sid, session, True
 
 
 def _parse_form(environ) -> dict[str, list[str]]:
@@ -103,8 +123,14 @@ def _html_response(start_response, body, title, role, session, students, active,
 
 
 def _cookie_for_session(session):
-    # The session key is attached for the request lifetime by CampusDeskApplication.
-    return _cookie(session["_sid"])
+    claims = {name: session.get(name, "") for name in
+              ("role", "student_id", "display_name", "login_name", "authenticated", "csrf")}
+    claims["sid"] = session["_sid"]
+    claims["expires_at"] = int(session.get("expires_at", time.time() + 28_800))
+    encoded = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode("utf-8")).rstrip(b"=").decode("ascii")
+    signature = hmac.new(SESSION_SECRET_BYTES, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    secure = "; Secure" if os.environ.get("VERCEL") else ""
+    return ("Set-Cookie", f"campusdesk_session={encoded}.{signature}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800{secure}")
 
 
 def _forbidden(start_response, sid, session, role, students, new_session=False):
@@ -177,6 +203,13 @@ class CampusDeskApplication:
     def __call__(self, environ, start_response):
         sid, session, new_session = _session(environ)
         session["_sid"] = sid
+        response_start = start_response
+
+        def start_response(status, headers, exc_info=None):
+            headers = [(name, value) for name, value in headers if name.lower() != "set-cookie"]
+            headers.append(_cookie_for_session(session))
+            return response_start(status, headers, exc_info)
+
         method = environ.get("REQUEST_METHOD", "GET").upper()
         path = environ.get("PATH_INFO", "/")
         if path.startswith("/static/"):
@@ -209,34 +242,31 @@ class CampusDeskApplication:
                         page = views.login_page(session["csrf"], "We couldn’t sign you in. Check your ID or email and password, then try again.")
                         headers = [_cookie(sid)] if new_session else None
                         return _response(start_response, page, "401 Unauthorized", extra_headers=headers)
-                    SESSIONS.pop(sid, None)
                     sid = secrets.token_urlsafe(32)
                     session.update({"role": account["role"], "student_id": account["student_id"],
                                     "display_name": account["display_name"], "login_name": account["login_name"],
                                     "authenticated": True, "csrf": secrets.token_urlsafe(24), "_sid": sid,
                                     "expires_at": time.time() + 28_800})
-                    SESSIONS[sid] = session
                     return _redirect(start_response, sid, "/", True)
                 page = views.login_page(session["csrf"], (query.get("error") or [""])[0])
                 headers = [_cookie(sid)] if new_session else None
                 return _response(start_response, page, extra_headers=headers)
             if path == "/logout" and method == "POST" and session.get("authenticated"):
-                SESSIONS.pop(sid, None)
                 sid = secrets.token_urlsafe(32)
                 session = {"role": "", "student_id": "", "display_name": "", "authenticated": False,
-                           "csrf": secrets.token_urlsafe(24), "_sid": sid, "expires_at": time.time() + 28_800}
-                SESSIONS[sid] = session
+                           "login_name": "", "csrf": secrets.token_urlsafe(24), "_sid": sid,
+                           "expires_at": time.time() + 28_800}
                 return _redirect(start_response, sid, "/login", True)
             if not session.get("authenticated"):
                 return _redirect(start_response, sid, "/login", new_session)
             role = session.get("role", "")
             if role not in ROLES:
-                SESSIONS.pop(sid, None)
+                session["authenticated"] = False
                 return _redirect(start_response, sid, "/login", new_session)
             choices = db.list_student_choices()
             choice_ids = {item[0] for item in choices}
             if role == "Student" and session.get("student_id") not in choice_ids:
-                SESSIONS.pop(sid, None)
+                session["authenticated"] = False
                 return _redirect(start_response, sid, "/login", new_session)
             if role != "Student" and session.get("student_id") not in choice_ids:
                 session["student_id"] = choices[0][0] if choices else ""

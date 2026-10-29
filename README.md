@@ -6,6 +6,8 @@ CampusDesk is a local college information system built with Python and SQLite. T
 
 This repository includes a Vercel Python WSGI entry point at `api/index.py` and root rewrite configuration. Push the project to GitHub, import it in Vercel, and deploy with the repository root as the project root.
 
+In Vercel, add a Production environment variable named `CAMPUSDESK_SESSION_SECRET` with a fresh random value (for example, generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`). The app uses it to sign session cookies across serverless instances; never commit the value to GitHub.
+
 **Important data limitation:** this version uses SQLite and in-process sessions. On Vercel, the database is placed under `/tmp`; it is disposable and can reset when an instance restarts, while in-memory sessions can disappear or differ between instances. Use this deployment only as a synthetic-data classroom/demo preview. Do not use real student information or collect real tuition payments. A reliable college deployment requires migrating SQLite to a managed PostgreSQL service and replacing in-memory sessions with a shared or signed stateless session design, plus institutional identity, HTTPS, and a security/privacy review.
 
 The Vercel Python runtime supports WSGI apps and Vercel rewrites route requests to the Python function. See [Python runtime documentation](https://vercel.com/docs/functions/runtimes/python) and [rewrite configuration](https://vercel.com/docs/routing/rewrites).
